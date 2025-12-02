@@ -1,0 +1,3 @@
+"""
+linlog test suite
+"""
