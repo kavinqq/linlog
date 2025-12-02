@@ -19,7 +19,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
     Uses file locking to prevent race conditions in multi-process environments (uwsgi, gunicorn).
     """
 
-    def __init__(self, filename, when='midnight', interval=1, backupCount=0,
+    def __init__(self, filename, when='midnight', interval=1, backupCount=180,
                  encoding=None, delay=False, utc=False, atTime=None):
         log_dir = os.path.dirname(filename)
         if log_dir and not os.path.exists(log_dir):
@@ -110,7 +110,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
 
     def _delete_old_backups(self):
         """Keep only the most recent backupCount files"""
-        # backupCount=0 means keep all files
+        # backupCount=0 means no rotation (all logs in one file)
         if self.backupCount == 0:
             return
 
