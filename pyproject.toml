@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "linlog"
+name = "linlog-py"
 version = "0.1.0"
 description = "Simple Python logging utilities with custom formatters, daily rotation, and request ID tracking"
 readme = "README.md"

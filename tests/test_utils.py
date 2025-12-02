@@ -5,7 +5,6 @@ Test request ID generation functionality.
 """
 
 import unittest
-import re
 from linlog.utils import (
     generate_request_id,
     DEFAULT_ALPHABET
