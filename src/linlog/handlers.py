@@ -89,7 +89,11 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         
         # rolloverAt is the midnight that triggered this rotation (e.g., 2025-12-03 00:00)
         # We want to archive the previous day's log (e.g., 2025-12-02)
-        rollover_datetime = datetime.fromtimestamp(self.rolloverAt)
+        if self.utc:
+            rollover_datetime = datetime.utcfromtimestamp(self.rolloverAt)
+        else:
+            rollover_datetime = datetime.fromtimestamp(self.rolloverAt)
+            
         archive_date = rollover_datetime - timedelta(days=1)
         date_str = archive_date.strftime('%Y-%m-%d')
         
@@ -98,10 +102,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
 
     def doRollover(self):
         """
-        Perform log rotation with file locking
-
-        Ensures only one process rotates the file at a time,
-        preventing race conditions in multi-process environments.
+        Perform log rotation with file locking and race condition handling
         """
         if self.stream:
             self.stream.close()
@@ -110,25 +111,50 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         try:
             self._acquire_lock()
 
+            # 1. Determine the target filename based on accurate rollover time
+            time_tuple = time.gmtime(self.rolloverAt) if self.utc else time.localtime(self.rolloverAt)
+            dfn = self.rotation_filename(
+                self.baseFilename + "." +
+                time.strftime(self.suffix, time_tuple)
+            )
+
+            # 2. Check if rotation has already occurred (Race Condition Check)
+            # If dfn exists AND has content, it means another process beat us to it.
+            should_rotate = True
+            if os.path.exists(dfn):
+                if os.path.getsize(dfn) > 0:
+                    should_rotate = False
+                else:
+                    # File exists but is empty (0 bytes). 
+                    # Likely a failed rotation or lock artifact from another process.
+                    # Safe to delete and retry rotation.
+                    try:
+                        os.remove(dfn)
+                    except OSError:
+                        pass # Might be locked or removed by others
+
+            # 3. Perform Rotation
+            if should_rotate and os.path.exists(self.baseFilename):
+                try:
+                    os.rename(self.baseFilename, dfn)
+                except OSError:
+                    # Rare case: file disappeared or locked between check and rename
+                    pass
+
+            # 4. Delete old backups (Only if configured)
+            if self.backupCount > 0:
+                self._delete_old_backups()
+
+            # 5. Update rollover time (Catch up to future)
             current_time = int(time.time())
             new_rollover_at = self.computeRollover(current_time)
-
-            if self.backupCount > 0:
-                dfn = self.rotation_filename(
-                    self.baseFilename + "." +
-                    time.strftime(self.suffix, time.localtime(self.rolloverAt))
-                )
-
-                if os.path.exists(self.baseFilename):
-                    if os.path.exists(dfn):
-                        os.remove(dfn)
-                    os.rename(self.baseFilename, dfn)
-                    self._delete_old_backups()
+            while new_rollover_at <= current_time:
+                new_rollover_at = new_rollover_at + self.interval
+            
+            self.rolloverAt = new_rollover_at
 
             if not self.delay:
                 self.stream = self._open()
-
-            self.rolloverAt = new_rollover_at
 
         finally:
             self._release_lock()

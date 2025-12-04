@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linlog-py"
-version = "0.1.2"
+version = "0.1.3"
 description = "Simple Python logging utilities with custom formatters, daily rotation, and request ID tracking"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Kuan Lin", email = "your.email@example.com"}
+    {name = "KuanLin", email = "isu10122068a@gmail.com"}
 ]
 keywords = ["logging", "request-id", "rotation", "formatter", "tracking"]
 classifiers = [
