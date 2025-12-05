@@ -51,6 +51,53 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         self._lock_file_path = self.baseFilename + '.lock'
         self.filename_pattern = filename_pattern
 
+        # Initialize rolloverAt based on existing file's mtime if it exists
+        # This prevents "Zombie Processes" from rotating a file that is already current
+        if os.path.exists(self.baseFilename):
+            try:
+                mtime = os.path.getmtime(self.baseFilename)
+                current_time = int(time.time())
+                
+                # If file was modified today (after last midnight), we should treat it as current.
+                # But if we calculated rolloverAt as "Tomorrow", we might skip rotation if the file is actually from "Yesterday".
+                # Wait, standard logic sets rolloverAt to Next Rollover.
+                # If file is old, we want to rotate immediately.
+                
+                # Calculate the midnight preceding the file's mtime
+                if self.utc:
+                    file_date = datetime.fromtimestamp(mtime, datetime.timezone.utc).date()
+                    now_date = datetime.now(datetime.timezone.utc).date()
+                else:
+                    file_date = datetime.fromtimestamp(mtime).date()
+                    now_date = datetime.now().date()
+                
+                if file_date < now_date:
+                    # File is from a previous day. Force rotation on first emit.
+                    # We do this by setting rolloverAt to a time in the past.
+                    # However, rotation_filename relies on rolloverAt to name the archive.
+                    # If we set rolloverAt = current_time, rotation_filename might use Today's date (wrong).
+                    # We need rolloverAt to be "Next Midnight" relative to the FILE's date.
+                    
+                    # Example: File is from 12-04. Today is 12-05.
+                    # We want to rotate it to 12-04.
+                    # rotation_filename uses (rolloverAt - 1 day).
+                    # So we want rolloverAt to be 12-05 00:00.
+                    
+                    # Let's calculate next midnight after file_date
+                    # But simplified: just set it to the midnight of the current day.
+                    # This means "It should have rolled over at 00:00 today".
+                    # Since now > 00:00, it will trigger.
+                    # And rotation_filename(00:00) -> 00:00 - 1 day = Yesterday. Correct.
+                    
+                    # Re-calculate rolloverAt based on current time to find "Today's Midnight" (which is in the past)
+                    # computeRollover(now) returns Tomorrow's Midnight.
+                    # So subtract interval?
+                    
+                    next_midnight = self.computeRollover(current_time)
+                    self.rolloverAt = next_midnight - self.interval
+            except (OSError, ValueError):
+                pass
+
     def _acquire_lock(self):
         """Acquire exclusive lock for file rotation"""
         self._lock_file = open(self._lock_file_path, 'w')
@@ -90,7 +137,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         # rolloverAt is the midnight that triggered this rotation (e.g., 2025-12-03 00:00)
         # We want to archive the previous day's log (e.g., 2025-12-02)
         if self.utc:
-            rollover_datetime = datetime.utcfromtimestamp(self.rolloverAt)
+            rollover_datetime = datetime.fromtimestamp(self.rolloverAt, datetime.timezone.utc)
         else:
             rollover_datetime = datetime.fromtimestamp(self.rolloverAt)
             
@@ -132,6 +179,31 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
                         os.remove(dfn)
                     except OSError:
                         pass # Might be locked or removed by others
+
+            # 2.5 Check if the CURRENT file is already from today (Safe Skip for Zombie Processes)
+            # If we are late to rotate (e.g. it's 09:00 and we want to rotate for 00:00),
+            # but the file has been modified TODAY (e.g. 08:00), it means someone else
+            # started a new log file without rotating the old one (or rotated it already).
+            # In this case, if we rotate now, we would archive TODAY's data as YESTERDAY's.
+            # So we must skip rotation.
+            if should_rotate and os.path.exists(self.baseFilename):
+                try:
+                    mtime = os.path.getmtime(self.baseFilename)
+                    if self.utc:
+                        file_date = datetime.fromtimestamp(mtime, datetime.timezone.utc).date()
+                        rollover_date = datetime.fromtimestamp(self.rolloverAt, datetime.timezone.utc).date()
+                    else:
+                        file_date = datetime.fromtimestamp(mtime).date()
+                        rollover_date = datetime.fromtimestamp(self.rolloverAt).date()
+                    
+                    # rolloverAt is usually "Today 00:00" (when rotation was due).
+                    # So rollover_date is Today.
+                    # If file_date is also Today, it means the file contains Today's data.
+                    # We should NOT rotate it into an archive for Yesterday.
+                    if file_date >= rollover_date:
+                        should_rotate = False
+                except (OSError, ValueError):
+                    pass
 
             # 3. Perform Rotation
             if should_rotate and os.path.exists(self.baseFilename):
