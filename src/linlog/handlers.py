@@ -1,12 +1,11 @@
 """
 Log Handlers
 
-Daily rotating file handler with file locking for multi-process safety.
+Daily rotating file handler with multi-process safety using optimistic locking.
 """
 
 import os
 import re
-import sys
 import time
 import logging.handlers
 from datetime import datetime, timedelta
@@ -16,12 +15,13 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
     """
     Daily rotating file handler with multi-process safety
 
-    Rotates log files daily at midnight with naming pattern: app.log.2024-12-02
-    Uses file locking to prevent race conditions in multi-process environments (uwsgi, gunicorn).
+    Rotates log files daily at midnight with naming pattern: debug.log.2024-12-02 (Ubuntu style)
+    Uses optimistic locking (atomic rename + exception handling) for multi-process safety.
     
-    Key difference from standard TimedRotatingFileHandler:
+    Key features:
     - Uses file's mtime (last modification time) to determine archive date
-    - NOT rolloverAt, which can be stale in multi-process/restart scenarios
+    - Uses atomic os.rename() + exception handling instead of file locks
+    - Automatically detects when another process has already rotated
     
     Args:
         filename_pattern: Format string for rotated files. Available placeholders:
@@ -30,7 +30,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
             - {date}: date string (e.g., "2025-12-02")
             
             Examples:
-            - "{base}{ext}.{date}" → debug.log.2025-12-02 (default, Linux style)
+            - "{base}{ext}.{date}" → debug.log.2025-12-02 (default, Ubuntu/Linux style)
             - "{base}_{date}{ext}" → debug_2025-12-02.log
     """
 
@@ -52,33 +52,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
             atTime=atTime
         )
 
-        self._lock_file_path = self.baseFilename + '.lock'
-        self._lock_file = None
         self.filename_pattern = filename_pattern
-
-    def _acquire_lock(self):
-        """Acquire exclusive lock for file rotation"""
-        self._lock_file = open(self._lock_file_path, 'w')
-
-        if sys.platform == 'win32':
-            import msvcrt
-            msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
-
-    def _release_lock(self):
-        """Release file rotation lock"""
-        if self._lock_file:
-            if sys.platform == 'win32':
-                import msvcrt
-                msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-
-            self._lock_file.close()
-            self._lock_file = None
 
     def _get_file_date(self):
         """
@@ -113,7 +87,7 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
             archive_date: The date to use for the archive filename (date object)
             
         Returns:
-            Full path to the archive file
+            Full path to the archive file (e.g., /var/log/debug.log.2025-12-05)
         """
         dir_name, base_name = os.path.split(self.baseFilename)
         name_parts = os.path.splitext(base_name)
@@ -122,7 +96,10 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         
         date_str = archive_date.strftime('%Y-%m-%d')
         rotated_name = self.filename_pattern.format(base=base, ext=ext, date=date_str)
-        return os.path.join(dir_name, rotated_name)
+        
+        if dir_name:
+            return os.path.join(dir_name, rotated_name)
+        return rotated_name
 
     def rotation_filename(self, default_name):
         """
@@ -133,7 +110,6 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         """
         file_date = self._get_file_date()
         if file_date is None:
-            # No file exists, use yesterday as fallback
             file_date = self._get_today() - timedelta(days=1)
             
         return self._build_archive_filename(file_date)
@@ -142,8 +118,9 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
         """
         Determine if rollover should occur.
         
-        We check if the current log file is from a previous day.
-        This is more reliable than checking rolloverAt in multi-process environments.
+        Returns True if:
+        1. Current log file is from a previous day (based on mtime)
+        2. Yesterday's archive already exists (another process rotated, need to reopen stream)
         """
         if self.stream is None:
             self.stream = self._open()
@@ -153,79 +130,95 @@ class DailyRotatingHandler(logging.handlers.TimedRotatingFileHandler):
             return False
             
         today = self._get_today()
-        return file_date < today
+        
+        # Case 1: File is from a previous day
+        if file_date < today:
+            return True
+        
+        # Case 2: Yesterday's archive exists (another process already rotated)
+        # This triggers "rollover" to reopen stream pointing to correct file
+        yesterday = today - timedelta(days=1)
+        yesterday_archive = self._build_archive_filename(yesterday)
+        if os.path.exists(yesterday_archive):
+            return True
+        
+        return False
 
     def doRollover(self):
         """
-        Perform log rotation with file locking.
+        Perform log rotation using optimistic locking.
         
-        Key logic:
-        1. Use file's mtime to determine which date the log belongs to
-        2. Archive to that date (not rolloverAt - 1 day)
-        3. Check for race conditions before renaming
+        Strategy:
+        1. Check file state and decide if rotation is needed
+        2. Attempt atomic rename
+        3. If rename fails (FileNotFoundError), check if another process did it
+        4. Always ensure stream is reopened correctly
         """
         if self.stream:
             self.stream.close()
             self.stream = None
 
-        try:
-            self._acquire_lock()
-
-            # Re-check after acquiring lock (another process may have rotated already)
-            file_date = self._get_file_date()
-            today = self._get_today()
-            
-            # If file doesn't exist or is already from today, skip rotation
-            if file_date is None or file_date >= today:
-                # Just open a new stream and update rolloverAt
-                current_time = int(time.time())
-                self.rolloverAt = self.computeRollover(current_time)
-                if not self.delay:
-                    self.stream = self._open()
-                return
-
-            # Calculate archive filename based on file's mtime (THE TRUTH)
-            dfn = self._build_archive_filename(file_date)
-
-            # Check if archive already exists (race condition protection)
-            should_rotate = True
-            if os.path.exists(dfn):
-                if os.path.getsize(dfn) > 0:
-                    # Archive already exists with content - someone else did it
-                    should_rotate = False
-                else:
-                    # Empty file - safe to remove and retry
-                    try:
-                        os.remove(dfn)
-                    except OSError:
-                        pass
-
-            # Perform the actual rotation
-            if should_rotate and os.path.exists(self.baseFilename):
-                # Final safety check: is the file STILL from a previous day?
-                current_file_date = self._get_file_date()
-                if current_file_date is not None and current_file_date < today:
-                    try:
-                        os.rename(self.baseFilename, dfn)
-                    except OSError:
-                        pass
-
-            # Delete old backups
-            if self.backupCount > 0:
-                self._delete_old_backups()
-
-            # Update rollover time for next check
-            current_time = int(time.time())
-            self.rolloverAt = self.computeRollover(current_time)
-
+        file_date = self._get_file_date()
+        today = self._get_today()
+        
+        # If file doesn't exist or is already from today, just reopen stream
+        if file_date is None or file_date >= today:
+            self._update_rollover_time()
             if not self.delay:
                 self.stream = self._open()
+            return
 
-        finally:
-            self._release_lock()
+        # Calculate archive filename based on file's mtime
+        dfn = self._build_archive_filename(file_date)
+
+        # Check if archive already exists
+        if os.path.exists(dfn):
+            if os.path.getsize(dfn) > 0:
+                # Archive exists with content - another process already did it
+                # Just reopen stream and continue
+                pass
+            else:
+                # Empty archive file (abnormal) - try to remove it
+                try:
+                    os.remove(dfn)
+                except OSError:
+                    pass
+        
+        # Attempt rotation if archive doesn't exist (or was empty and removed)
+        if not os.path.exists(dfn) and os.path.exists(self.baseFilename):
+            try:
+                os.rename(self.baseFilename, dfn)
+            except FileNotFoundError:
+                # Another process renamed the file first
+                # Check if archive now exists (confirms another process did it)
+                if os.path.exists(dfn):
+                    # Good - another process completed rotation
+                    pass
+                else:
+                    # File genuinely missing - unusual but not fatal
+                    pass
+            except OSError:
+                # Other errors (permissions, disk full, etc.)
+                pass
+
+        # Delete old backups
+        if self.backupCount > 0:
+            self._delete_old_backups()
+
+        # Update rollover time
+        self._update_rollover_time()
+
+        # Reopen stream (pointing to new/current debug.log)
+        if not self.delay:
+            self.stream = self._open()
+
+    def _update_rollover_time(self):
+        """Update rolloverAt to next rollover time."""
+        current_time = int(time.time())
+        self.rolloverAt = self.computeRollover(current_time)
 
     def _delete_old_backups(self):
-        """Keep only the most recent backupCount files"""
+        """Keep only the most recent backupCount files."""
         if self.backupCount == 0:
             return
 
