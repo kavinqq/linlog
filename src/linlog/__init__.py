@@ -7,7 +7,7 @@ Features:
 - UUIDFilter: Request ID tracking for log correlation
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Kuan Lin"
 
 from .formatters import StandardFormatter, JSONFormatter
